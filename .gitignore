@@ -1,0 +1,31 @@
+# ---- secrets ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- vision ai runtime state (regenerable; never commit) -------------------
+data/
+!data/.gitkeep
+*.sqlite3
+
+# ---- node / frontend -------------------------------------------------------
+node_modules/
+dist/
+.vite/
+frontend/dist/
+
+# ---- os / editor -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,40 @@
+# ---- Vision AI :: backend requirements -------------------------------------
+# Python 3.11+
+
+# API layer
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+websockets>=12.0
+
+# Config / validation
+pydantic>=2.8.0
+pydantic-settings>=2.4.0
+python-dotenv>=1.0.1
+
+# Agent orchestration
+langgraph>=0.2.28
+langchain-core>=0.3.0
+# Durable Goal Mode runs (checkpointer + run index)
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite>=0.20.0
+
+# Vector memory (Digital Twin + Skill DB)
+chromadb>=0.5.5
+
+# LLM providers (all optional at runtime; the mock provider needs none)
+openai>=1.40.0
+httpx>=0.27.0
+
+# YouTube Skill Acquisition
+yt-dlp>=2024.8.6
+
+# Multi-modal output
+matplotlib>=3.9.0
+
+# Sandboxed execution (Goal Mode tool calls)
+docker>=7.1.0
+
+# Dev / test
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
