@@ -44,6 +44,30 @@ export interface GoalEvent {
   [key: string]: unknown;
 }
 
+export interface ApprovalRequest {
+  id: string;
+  run_id: string;
+  task_id: string;
+  tool: string;
+  payload: string;
+  reason: string;
+  safe_alternative: string | null;
+  violated_principles: string[];
+  seconds_remaining: number;
+  state: string;
+}
+
+export interface RunSummary {
+  id: string;
+  goal: string;
+  status: "running" | "completed" | "failed" | "interrupted" | "cancelled";
+  created_at: number;
+  updated_at: number;
+  final_answer: string;
+  error: string;
+  resumable: boolean;
+}
+
 export interface Skill {
   skill_id: string;
   title: string;
@@ -133,14 +157,40 @@ export const api = {
 
   artifacts: () =>
     request<{ artifacts: Array<{ path: string; size: number; modified: number }> }>("/api/artifacts"),
+
+  listRuns: (limit = 30) => request<{ runs: RunSummary[] }>(`/api/runs?limit=${limit}`),
+
+  getRun: (runId: string) =>
+    request<RunSummary & { checkpoint: { has_state: boolean; next?: string[] } }>(
+      `/api/runs/${runId}`,
+    ),
+
+  listApprovals: () =>
+    request<{ pending: ApprovalRequest[]; history: Array<Record<string, unknown>> }>(
+      "/api/approvals",
+    ),
+
+  decideApproval: (id: string, approved: boolean, note = "") =>
+    request<Record<string, unknown>>(`/api/approvals/${id}`, {
+      method: "POST",
+      body: JSON.stringify({ approved, note, decided_by: "user" }),
+    }),
 };
 
-/** Open a Goal Mode websocket. Returns a closer. */
+export interface GoalStreamHandle {
+  /** Answer a pending approval over the same socket the agent is waiting on. */
+  decide: (requestId: string, approved: boolean, note?: string) => void;
+  cancel: () => void;
+  close: () => void;
+}
+
+/** Open a Goal Mode websocket. Pass `resumeRunId` to continue an interrupted run. */
 export function streamGoal(
   goal: string,
   handlers: {
     onEvent: (e: GoalEvent) => void;
     onFinal: (payload: {
+      run_id: string;
       final_answer: string;
       tasks: AgentTask[];
       reflection: Record<string, unknown>;
@@ -148,20 +198,54 @@ export function streamGoal(
     }) => void;
     onError: (message: string) => void;
     onClose?: () => void;
+    onRunStarted?: (runId: string, goal: string) => void;
+    onApprovalRequired?: (request: ApprovalRequest) => void;
+    onApprovalResolved?: (requestId: string, state: string) => void;
   },
-): () => void {
+  resumeRunId?: string,
+): GoalStreamHandle {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${proto}//${window.location.host}/ws/goal`);
 
-  ws.onopen = () => ws.send(JSON.stringify({ goal }));
+  ws.onopen = () =>
+    ws.send(JSON.stringify(resumeRunId ? { goal, resume_run_id: resumeRunId } : { goal }));
+
   ws.onmessage = (ev) => {
     const data = JSON.parse(ev.data);
-    if (data.type === "final") handlers.onFinal(data);
-    else if (data.type === "error") handlers.onError(String(data.message));
-    else handlers.onEvent(data as GoalEvent);
+    switch (data.type) {
+      case "final":
+        handlers.onFinal(data);
+        break;
+      case "error":
+        handlers.onError(String(data.message));
+        break;
+      case "run_started":
+        handlers.onRunStarted?.(String(data.run_id), String(data.goal));
+        handlers.onEvent(data as GoalEvent);
+        break;
+      case "approval_required":
+        handlers.onApprovalRequired?.(data.request as ApprovalRequest);
+        handlers.onEvent(data as GoalEvent);
+        break;
+      case "approval_resolved":
+        handlers.onApprovalResolved?.(String(data.request_id), String(data.state));
+        handlers.onEvent(data as GoalEvent);
+        break;
+      default:
+        handlers.onEvent(data as GoalEvent);
+    }
   };
   ws.onerror = () => handlers.onError("WebSocket connection failed.");
   ws.onclose = () => handlers.onClose?.();
 
-  return () => ws.close();
+  const send = (payload: Record<string, unknown>) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  };
+
+  return {
+    decide: (requestId, approved, note = "") =>
+      send({ type: "approval_decision", request_id: requestId, approved, note }),
+    cancel: () => send({ type: "cancel" }),
+    close: () => ws.close(),
+  };
 }

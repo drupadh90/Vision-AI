@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, TypedDict
@@ -30,6 +31,7 @@ from ..core.llm import LLMClient, Message
 from ..guardian.guardian import Guardian
 from ..memory.digital_twin import DigitalTwinMemory, ReflectionLoop
 from ..skills.skill_store import SkillLibrary
+from .approvals import ApprovalGate
 from .sub_agents import AgentRole, SubAgentOutput, resolve_role, spawn
 from .tools import ToolBelt
 
@@ -79,6 +81,7 @@ class Task:
 class GoalState(TypedDict, total=False):
     goal: str
     user_id: str
+    run_id: str
     strategy: str
     tasks: list[dict[str, Any]]
     wave: int
@@ -206,15 +209,21 @@ class GoalModeEngine:
         toolbelt: ToolBelt | None = None,
         settings: Settings | None = None,
         event_sink: EventSink | None = None,
+        checkpointer: Any | None = None,
+        approvals: ApprovalGate | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.llm = llm
         self.memory = memory
         self.skills = skills
         self.guardian = guardian
-        self.toolbelt = toolbelt or ToolBelt(guardian, settings=self.settings)
+        self.approvals = approvals
+        self.toolbelt = toolbelt or ToolBelt(
+            guardian, settings=self.settings, approvals=approvals
+        )
         self.reflection = ReflectionLoop(memory, llm)
         self.event_sink = event_sink
+        self.checkpointer = checkpointer
         self._sem = asyncio.Semaphore(self.settings.max_concurrency)
         self.graph = self._build_graph()
 
@@ -356,6 +365,9 @@ class GoalModeEngine:
                     state, "task_started", task_id=task.id, title=task.title, agent=task.agent
                 )
                 role: AgentRole = resolve_role(task.agent)
+                # Tag the toolbelt so any approval prompt can name the asker.
+                self.toolbelt.run_id = state.get("run_id", "")
+                self.toolbelt.task_id = task.id
                 agent = spawn(role, self.llm, self.toolbelt)
                 dep_ctx = "\n\n".join(
                     f"### Output of '{by_id[d].title}' ({d})\n{by_id[d].result[:3000]}"
@@ -557,14 +569,43 @@ class GoalModeEngine:
         )
         g.add_edge("synthesize", "reflect")
         g.add_edge("reflect", END)
-        return g.compile()
+        # With a checkpointer attached, every node transition is persisted, so a
+        # run that dies mid-flight can be resumed from its last completed node.
+        return g.compile(checkpointer=self.checkpointer) if self.checkpointer else g.compile()
 
-    async def run(self, goal: str, user_id: str = "default") -> GoalState:
+    def _config(self, run_id: str) -> dict[str, Any]:
+        cfg: dict[str, Any] = {"recursion_limit": self.settings.max_subtasks * 6 + 20}
+        if self.checkpointer is not None:
+            # thread_id is the durable handle used to resume this exact run.
+            cfg["configurable"] = {"thread_id": run_id}
+        return cfg
+
+    async def run(self, goal: str, user_id: str = "default", run_id: str = "") -> GoalState:
+        rid = run_id or uuid.uuid4().hex[:16]
         initial: GoalState = {
-            "goal": goal, "user_id": user_id, "tasks": [], "events": [],
-            "wave": 0, "done": False,
+            "goal": goal, "user_id": user_id, "run_id": rid, "tasks": [],
+            "events": [], "wave": 0, "done": False,
         }
-        result = await self.graph.ainvoke(
-            initial, config={"recursion_limit": self.settings.max_subtasks * 6 + 20}
-        )
+        result = await self.graph.ainvoke(initial, config=self._config(rid))
         return dict(result)  # type: ignore[return-value]
+
+    async def resume(self, run_id: str) -> GoalState:
+        """Continue an interrupted run from its last persisted checkpoint."""
+        if self.checkpointer is None:
+            raise RuntimeError("Cannot resume: no checkpointer configured.")
+        config = self._config(run_id)
+        snapshot = await self.graph.aget_state(config)
+        if not snapshot.values:
+            raise ValueError(f"No checkpoint found for run '{run_id}'.")
+        logger.info("resuming run %s (next node: %s)", run_id, snapshot.next)
+        # Passing None replays from the checkpoint instead of restarting.
+        result = await self.graph.ainvoke(None, config=config)
+        return dict(result)  # type: ignore[return-value]
+
+    async def get_state(self, run_id: str) -> dict[str, Any] | None:
+        if self.checkpointer is None:
+            return None
+        snapshot = await self.graph.aget_state(self._config(run_id))
+        if not snapshot.values:
+            return None
+        return {"values": dict(snapshot.values), "next": list(snapshot.next)}

@@ -13,6 +13,8 @@ differences that matter are architectural, not cosmetic:
 | Learning | Fixed capabilities | **YouTube Skill Acquisition** — watch a tutorial, gain a timestamped, retrievable skill |
 | Execution | Sequential tool loop | **LangGraph DAG** — independent sub-tasks run concurrently; a Manager reviews and re-assigns |
 | Safety | Prompt-level "please be careful" | **Constitutional pre-execution filter** — path jail + deterministic pattern blocks + Guardian LLM, failing closed |
+| Oversight | All-or-nothing autonomy | **Human-in-the-loop approvals** — consequential actions pause for a decision and deny on silence |
+| Durability | A crash loses the run | **Checkpointed runs** — resume from the last completed step without re-paying for finished work |
 | Initiative | Waits for commands | **Proactive Intuition** — offers a relevant learned skill, on a strict interruption budget |
 
 ---
@@ -130,6 +132,33 @@ Four layers, cheapest first:
 The pattern layer is **not** delegated to the model: `rm -rf /` is blocked even
 if the LLM is offline or jailbroken. Guardian errors **fail closed**.
 
+### 4b. Human-in-the-loop approvals (`backend/app/agents/approvals.py`)
+`deny` is automatic; `needs_approval` is not. Legal-but-consequential actions
+(installing packages, sending messages, irreversible external writes) suspend
+the sub-agent on an `asyncio.Event` and surface a card in the UI with the exact
+command, the reason, and a live countdown.
+
+The guarantees that matter:
+
+* **Silence denies.** An unanswered request expires into a denial — consent is
+  never inferred from inaction.
+* **Disconnect denies immediately.** Closing the tab releases the waiter at
+  once instead of stalling the agent until the deadline.
+* **Hard denials are not negotiable.** A constitutional violation never reaches
+  the approval gate; no human click can authorise `rm -rf /`.
+* **No channel means no execution.** With no UI attached, a consequential
+  action is refused rather than quietly run.
+
+### 4c. Durable runs (`backend/app/agents/run_store.py`)
+Goal Mode compiles with a LangGraph SQLite checkpointer, so every node
+transition is persisted against a `thread_id`. A separate run index tracks which
+runs exist and their status; on boot, any run still marked `running` is flagged
+`interrupted` and offered for resume in the UI.
+
+Resume genuinely continues — verified by instrumenting the LLM: after a crash
+during synthesis, resuming made **zero** additional planner or worker calls and
+still produced the deliverable.
+
 ### 5. Proactive Intuition & multi-modal output
 Context-triggered suggestions gated by cooldown, confidence floor and
 de-duplication. Agents write files, render charts (matplotlib) and emit
@@ -158,7 +187,11 @@ markdown that the UI renders safely as React elements — never `innerHTML`.
 |---|---|---|
 | `GET` | `/api/health` | providers, executor, guardian, memory/skill counts |
 | `POST` | `/api/goal` | run Goal Mode synchronously |
-| `WS` | `/ws/goal` | stream plan, tasks, verdicts, reflection live |
+| `WS` | `/ws/goal` | stream plan, tasks, verdicts, reflection live; answer approvals inline |
+| `GET` | `/api/runs` | list runs, with `resumable` flags |
+| `POST` | `/api/runs/{id}/resume` | continue an interrupted run from its checkpoint |
+| `GET` | `/api/approvals` | pending approval requests |
+| `POST` | `/api/approvals/{id}` | approve or deny a paused action |
 | `POST` | `/api/skills/learn` | ingest a YouTube video |
 | `POST` | `/api/skills/activate` | preview the injected skill prompt |
 | `POST` | `/api/memory/recall` | query the Digital Twin |
@@ -182,9 +215,11 @@ backend/app/
   memory/            vector_store.py · digital_twin.py (+ reflection loop)
   skills/            youtube_ingest.py · skill_store.py
   agents/            goal_graph.py · sub_agents.py · tools.py · intuition.py
+                     approvals.py (human-in-the-loop) · run_store.py (durable runs)
   guardian/          constitution.py · guardian.py
 frontend/src/        App.tsx · components/ · lib/api.ts · lib/markdown.tsx
-tests/               76 tests (guardian, goal DAG, skills, memory)
+tests/               102 tests (guardian, goal DAG, skills, memory,
+                     approvals, persistence)
 scripts/demo.py      end-to-end offline demo
 ```
 
@@ -198,11 +233,12 @@ pytest tests/test_guardian.py -v     # adversarial security cases
 Coverage highlights: 18 dangerous commands blocked with 0 false positives on 11
 benign ones, DAG cycle/dangling/duplicate detection, verified **parallel**
 wave execution, manager rejection + re-assignment, skill retrieval precision,
-and preference reinforcement.
+preference reinforcement, approval fail-closed behaviour, and true crash-resume
+across a simulated process restart.
 
 ## Roadmap
 
-- Persist Goal Mode runs so long jobs survive a restart (LangGraph checkpointer)
-- Human-in-the-loop approval UI for `needs_approval` verdicts
 - Web search + browser tools for the Research Agent
 - Multi-user auth with per-user memory namespaces
+- Streaming token output from sub-agents (currently per-task granularity)
+- Approval policies (remember "always allow `pytest`" per project)

@@ -57,6 +57,7 @@ async def main() -> None:
         VISION_CHROMA_PATH=str(workdir / "chroma"),
         VISION_WORKSPACE_DIR=str(workdir / "workspace"),
         VISION_AUDIO_CACHE=str(workdir / "audio"),
+        VISION_CHECKPOINT_PATH=str(workdir / "checkpoints.sqlite"),
         VISION_EXECUTOR="subprocess",  # demo only; Docker is the default
     )
     settings.ensure_dirs()
@@ -171,6 +172,90 @@ async def main() -> None:
         print(f"    {DIM}confidence {suggestion.confidence:.2f} · {suggestion.rationale}{RESET}")
     repeat = await intuition.observe("import pandas as pd  # same context again", user_id="demo")
     print(f"  cooldown holds    : {repeat is None}")
+
+    # -- 8. human-in-the-loop approvals -------------------------------------
+    header(8, "Human-in-the-loop approvals (needs_approval verdicts)")
+    from app.agents.approvals import ApprovalGate  # noqa: PLC0415
+    from app.guardian.guardian import Decision  # noqa: PLC0415
+
+    gate = ApprovalGate(settings)
+    gated_belt = ToolBelt(guardian, settings=settings, approvals=gate)
+
+    async def answer(approved: bool) -> None:
+        await asyncio.sleep(0.1)
+        pending = gate.pending()
+        if pending:
+            await gate.decide(pending[0]["id"], approved=approved, decided_by="demo-user")
+
+    for approved in (True, False):
+        task = asyncio.create_task(
+            gated_belt.call("shell", command="pip install requests", reason="need a dep")
+        )
+        await answer(approved)
+        result = await task
+        label = "APPROVED" if approved else "DENIED"
+        colour = GREEN if approved else RED
+        print(f"  {colour}{label:<9}{RESET} → blocked={result.blocked} "
+              f"{DIM}({result.output.splitlines()[0][:60]}){RESET}")
+
+    # Silence must deny, never drift into an allow.
+    impatient = Settings(**{**settings.model_dump(by_alias=True), "VISION_APPROVAL_TIMEOUT_SECONDS": 0.4})
+    quiet_gate = ApprovalGate(impatient)
+    quiet_belt = ToolBelt(guardian, settings=impatient, approvals=quiet_gate)
+    timed_out = await quiet_belt.call("shell", command="pip install numpy")
+    print(f"  {YELLOW}NO ANSWER{RESET} → blocked={timed_out.blocked} "
+          f"{DIM}(fail-closed after deadline){RESET}")
+
+    hard = await gated_belt.call("shell", command="rm -rf /")
+    print(f"  {RED}CONSTITUTIONAL{RESET} → blocked={hard.blocked}, "
+          f"asked-for-approval={len(gate.pending()) > 0} "
+          f"{DIM}(no human can authorise this){RESET}")
+
+    # -- 9. durable runs -----------------------------------------------------
+    header(9, "Durable runs — crash, restart, resume")
+    import aiosqlite  # noqa: PLC0415
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: PLC0415
+
+    conn = await aiosqlite.connect(str(settings.checkpoint_path))
+    saver = AsyncSqliteSaver(conn)
+    await saver.setup()
+
+    crashing = GoalModeEngine(llm, memory, skills, guardian, toolbelt, settings,
+                              checkpointer=saver)
+    original_synth = crashing._node_synthesize
+    armed = {"v": True}
+
+    async def crash(state):
+        if armed["v"]:
+            raise RuntimeError("simulated power loss")
+        return await original_synth(state)
+
+    crashing._node_synthesize = crash  # type: ignore[method-assign]
+    crashing.graph = crashing._build_graph()
+
+    try:
+        await crashing.run("Summarise quarterly results", run_id="demo-run", user_id="demo")
+    except RuntimeError:
+        print(f"  {RED}✗ run crashed during synthesis{RESET}")
+
+    snapshot = await crashing.get_state("demo-run")
+    done_before = sum(1 for t in (snapshot or {}).get("values", {}).get("tasks", [])
+                      if t.get("status") == "done")
+    print(f"  checkpoint survived : {done_before} completed sub-task(s) on disk")
+    await conn.close()
+
+    print(f"  {DIM}--- restarting process (new connection, new engine) ---{RESET}")
+    armed["v"] = False
+    conn2 = await aiosqlite.connect(str(settings.checkpoint_path))
+    saver2 = AsyncSqliteSaver(conn2)
+    await saver2.setup()
+    revived = GoalModeEngine(llm, memory, skills, guardian, toolbelt, settings,
+                             checkpointer=saver2)
+    resumed = await revived.resume("demo-run")
+    print(f"  {GREEN}✓ resumed{RESET} → deliverable of {len(resumed['final_answer'])} chars, "
+          f"tasks={[t['status'] for t in resumed['tasks']]}")
+    print(f"  {DIM}work already finished was not repeated{RESET}")
+    await conn2.close()
 
     print(f"\n{BOLD}{GREEN}Demo complete.{RESET} "
           f"{DIM}Set OPENAI_API_KEY + VISION_LLM_PROVIDER=openai for real reasoning.{RESET}")

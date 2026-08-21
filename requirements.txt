@@ -15,6 +15,9 @@ python-dotenv>=1.0.1
 # Agent orchestration
 langgraph>=0.2.28
 langchain-core>=0.3.0
+# Durable Goal Mode runs (checkpointer + run index)
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite>=0.20.0
 
 # Vector memory (Digital Twin + Skill DB)
 chromadb>=0.5.5

@@ -16,6 +16,7 @@ from typing import Any, Callable
 from ..config import Settings, get_settings
 from ..core.executor import BaseExecutor, build_executor, safe_workspace_path
 from ..guardian.guardian import ActionType, Decision, Guardian, ProposedAction
+from .approvals import ApprovalGate
 
 logger = logging.getLogger("vision.tools")
 
@@ -29,6 +30,7 @@ class ToolResult:
     verdict: dict[str, Any] | None = None
     artifacts: list[str] = field(default_factory=list)
     duration_s: float = 0.0
+    approval: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -39,6 +41,7 @@ class ToolResult:
             "verdict": self.verdict,
             "artifacts": self.artifacts,
             "duration_s": round(self.duration_s, 3),
+            "approval": self.approval,
         }
 
 
@@ -48,10 +51,16 @@ class ToolBelt:
         guardian: Guardian,
         executor: BaseExecutor | None = None,
         settings: Settings | None = None,
+        approvals: ApprovalGate | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.guardian = guardian
         self.executor = executor or build_executor(self.settings)
+        self.approvals = approvals
+        # Set per-run by the Goal Mode engine so approval prompts can say which
+        # task is asking.
+        self.run_id: str = ""
+        self.task_id: str = ""
         self._tools: dict[str, Callable[..., Any]] = {
             "shell": self._shell,
             "python": self._python,
@@ -70,7 +79,56 @@ class ToolBelt:
 
         action = self._describe(tool, kwargs)
         verdict = await self.guardian.review(action)
-        if verdict.decision is not Decision.ALLOW:
+        approval_record: dict[str, Any] | None = None
+
+        if verdict.decision is Decision.NEEDS_APPROVAL:
+            if self.approvals is None:
+                # No gate wired up: a consequential action with nobody to ask
+                # must not proceed silently.
+                return ToolResult(
+                    tool=tool,
+                    ok=False,
+                    output=(
+                        f"BLOCKED ({verdict.layer}): {verdict.reason}\n"
+                        "This action requires human approval, but no approval channel "
+                        "is connected. Re-run with the UI attached to approve it."
+                    ),
+                    blocked=True,
+                    verdict=verdict.to_dict(),
+                    duration_s=time.monotonic() - start,
+                )
+            outcome = await self.approvals.request(
+                action=action,
+                verdict=verdict,
+                tool=tool,
+                run_id=self.run_id,
+                task_id=self.task_id,
+            )
+            approval_record = {
+                "state": outcome.state.value,
+                "decided_by": outcome.decided_by,
+                "note": outcome.note,
+            }
+            if not outcome.approved:
+                return ToolResult(
+                    tool=tool,
+                    ok=False,
+                    output=(
+                        f"BLOCKED — human approval refused. {outcome.message}"
+                        + (
+                            f"\nSafe alternative: {verdict.safe_alternative}"
+                            if verdict.safe_alternative
+                            else ""
+                        )
+                    ),
+                    blocked=True,
+                    verdict=verdict.to_dict(),
+                    approval=approval_record,
+                    duration_s=time.monotonic() - start,
+                )
+            logger.info("tool %s proceeding after human approval", tool)
+
+        elif verdict.decision is not Decision.ALLOW:
             msg = (
                 f"BLOCKED by Guardian ({verdict.layer}): {verdict.reason}"
                 + (f"\nSafe alternative: {verdict.safe_alternative}" if verdict.safe_alternative else "")
@@ -85,6 +143,7 @@ class ToolBelt:
             logger.exception("tool %s failed", tool)
             result = ToolResult(tool=tool, ok=False, output=f"{type(exc).__name__}: {exc}")
         result.verdict = verdict.to_dict()
+        result.approval = approval_record
         result.duration_s = time.monotonic() - start
         return result
 

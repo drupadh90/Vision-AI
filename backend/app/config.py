@@ -20,6 +20,7 @@ EmbeddingProviderName = Literal["openai", "hash"]
 TranscriberName = Literal["whisper_api", "captions", "auto"]
 ExecutorName = Literal["docker", "subprocess", "disabled"]
 GuardianMode = Literal["enforce", "monitor"]
+ApprovalMode = Literal["human", "auto_approve", "auto_deny"]
 
 
 class Settings(BaseSettings):
@@ -67,6 +68,10 @@ class Settings(BaseSettings):
     audio_cache: Path = Field(REPO_ROOT / "data" / "audio", alias="VISION_AUDIO_CACHE")
 
     # ---- goal mode ---------------------------------------------------------
+    checkpoint_enabled: bool = Field(True, alias="VISION_CHECKPOINT_ENABLED")
+    checkpoint_path: Path = Field(
+        REPO_ROOT / "data" / "checkpoints.sqlite", alias="VISION_CHECKPOINT_PATH"
+    )
     max_subtasks: int = Field(12, alias="VISION_MAX_SUBTASKS")
     max_concurrency: int = Field(4, alias="VISION_MAX_CONCURRENCY")
     max_task_retries: int = Field(2, alias="VISION_MAX_TASK_RETRIES")
@@ -76,6 +81,10 @@ class Settings(BaseSettings):
     guardian_enabled: bool = Field(True, alias="VISION_GUARDIAN_ENABLED")
     guardian_mode: GuardianMode = Field("enforce", alias="VISION_GUARDIAN_MODE")
     guardian_llm_review: bool = Field(True, alias="VISION_GUARDIAN_LLM_REVIEW")
+
+    # ---- human-in-the-loop approvals --------------------------------------
+    approval_mode: ApprovalMode = Field("human", alias="VISION_APPROVAL_MODE")
+    approval_timeout_seconds: float = Field(300.0, alias="VISION_APPROVAL_TIMEOUT_SECONDS")
 
     # ---- execution ---------------------------------------------------------
     executor: ExecutorName = Field("docker", alias="VISION_EXECUTOR")
@@ -98,7 +107,7 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="VISION_LOG_LEVEL")
 
     # ---- derived helpers ---------------------------------------------------
-    @field_validator("chroma_path", "audio_cache", "workspace_dir", mode="after")
+    @field_validator("chroma_path", "audio_cache", "workspace_dir", "checkpoint_path", mode="after")
     @classmethod
     def _absolutise(cls, v: Path) -> Path:
         return v if v.is_absolute() else (REPO_ROOT / v).resolve()
@@ -138,6 +147,8 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> None:
         for p in (self.chroma_path, self.audio_cache, self.workspace_dir):
             p.mkdir(parents=True, exist_ok=True)
+        # checkpoint_path is a FILE; only its parent needs to exist.
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache(maxsize=1)

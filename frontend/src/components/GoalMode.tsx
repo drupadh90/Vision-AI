@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { streamGoal, type AgentTask, type GoalEvent } from "../lib/api";
+import {
+  api,
+  streamGoal,
+  type AgentTask,
+  type ApprovalRequest,
+  type GoalEvent,
+  type GoalStreamHandle,
+  type RunSummary,
+} from "../lib/api";
 import { Markdown } from "../lib/markdown";
+import { ApprovalPrompt } from "./ApprovalPrompt";
 
 const AGENT_COLORS: Record<string, string> = {
   research: "bg-sky-500/15 text-sky-300 border-sky-500/30",
@@ -60,6 +69,12 @@ function eventLabel(e: GoalEvent): { text: string; tone: string } {
       return { text: `Goal failed: ${e.reason}`, tone: "text-rose-300" };
     case "reflection_written":
       return { text: `Reflection stored: ${e.lesson ?? "—"}`, tone: "text-fuchsia-300" };
+    case "run_started":
+      return { text: `Run ${String(e.run_id).slice(0, 8)} started`, tone: "text-slate-500" };
+    case "approval_required":
+      return { text: "⏸ Paused — awaiting your approval", tone: "text-amber-300" };
+    case "approval_resolved":
+      return { text: `Approval ${e.state}`, tone: "text-amber-300" };
     default:
       return { text: e.type, tone: "text-slate-500" };
   }
@@ -73,26 +88,51 @@ export function GoalMode() {
   const [answer, setAnswer] = useState("");
   const [reflection, setReflection] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState("");
-  const closerRef = useRef<(() => void) | null>(null);
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [activeRun, setActiveRun] = useState("");
+  const handleRef = useRef<GoalStreamHandle | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
   }, [events]);
 
-  useEffect(() => () => closerRef.current?.(), []);
+  useEffect(() => () => handleRef.current?.close(), []);
 
-  const start = useCallback(() => {
-    const trimmed = goal.trim();
-    if (!trimmed || running) return;
-    setRunning(true);
-    setEvents([]);
-    setTasks([]);
-    setAnswer("");
-    setReflection(null);
-    setError("");
+  const refreshRuns = useCallback(async () => {
+    try {
+      const data = await api.listRuns(15);
+      setRuns(data.runs);
+    } catch {
+      /* backend may not be up yet */
+    }
+  }, []);
 
-    closerRef.current = streamGoal(trimmed, {
+  useEffect(() => {
+    void refreshRuns();
+  }, [refreshRuns]);
+
+  const decide = useCallback((id: string, approved: boolean, note: string) => {
+    handleRef.current?.decide(id, approved, note);
+    setApprovals((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const launch = useCallback(
+    (text: string, resumeRunId?: string) => {
+      const trimmed = text.trim();
+      if ((!trimmed && !resumeRunId) || running) return;
+      setRunning(true);
+      setEvents([]);
+      setTasks([]);
+      setAnswer("");
+      setReflection(null);
+      setError("");
+      setApprovals([]);
+
+      handleRef.current = streamGoal(
+        trimmed,
+        {
       onEvent: (e) => {
         setEvents((prev) => [...prev, e]);
         if (e.type === "plan_ready") setTasks(e.tasks as AgentTask[]);
@@ -114,19 +154,36 @@ export function GoalMode() {
           );
         }
       },
-      onFinal: (payload) => {
-        setAnswer(payload.final_answer);
-        setTasks(payload.tasks);
-        setReflection(payload.reflection);
-        setRunning(false);
-      },
-      onError: (message) => {
-        setError(message);
-        setRunning(false);
-      },
-      onClose: () => setRunning(false),
-    });
-  }, [goal, running]);
+          onFinal: (payload) => {
+            setAnswer(payload.final_answer);
+            setTasks(payload.tasks);
+            setReflection(payload.reflection);
+            setApprovals([]);
+            setRunning(false);
+            void refreshRuns();
+          },
+          onError: (message) => {
+            setError(message);
+            setRunning(false);
+            void refreshRuns();
+          },
+          onClose: () => setRunning(false),
+          onRunStarted: (runId) => {
+            setActiveRun(runId);
+            void refreshRuns();
+          },
+          onApprovalRequired: (request) =>
+            setApprovals((prev) => [...prev, request]),
+          onApprovalResolved: (requestId) =>
+            setApprovals((prev) => prev.filter((a) => a.id !== requestId)),
+        },
+        resumeRunId,
+      );
+    },
+    [running, refreshRuns],
+  );
+
+  const start = useCallback(() => launch(goal), [goal, launch]);
 
   return (
     <div className="grid gap-4 lg:grid-cols-[1fr_380px]">
@@ -173,7 +230,49 @@ export function GoalMode() {
               {error}
             </p>
           )}
+          {activeRun && (
+            <p className="mt-2 font-mono text-[10px] text-slate-600">run {activeRun}</p>
+          )}
         </div>
+
+        {approvals.map((request) => (
+          <ApprovalPrompt key={request.id} request={request} onDecide={decide} />
+        ))}
+
+        {!running && runs.some((r) => r.resumable) && (
+          <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] p-4">
+            <h3 className="mb-1 text-sm font-semibold text-amber-200">Unfinished runs</h3>
+            <p className="mb-3 text-xs text-slate-500">
+              These runs were interrupted by a restart. Their progress is checkpointed —
+              resuming continues from the last completed step instead of starting over.
+            </p>
+            <ul className="space-y-2">
+              {runs
+                .filter((r) => r.resumable)
+                .map((r) => (
+                  <li
+                    key={r.id}
+                    className="flex items-center justify-between gap-3 rounded-lg border
+                               border-vision-border/60 bg-black/20 p-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-slate-300">{r.goal}</p>
+                      <p className="font-mono text-[10px] text-slate-600">
+                        {r.id.slice(0, 8)} · {r.status}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => launch(r.goal, r.id)}
+                      className="shrink-0 rounded-lg border border-amber-500/40 px-3 py-1 text-xs
+                                 text-amber-300 transition hover:bg-amber-500/10"
+                    >
+                      Resume
+                    </button>
+                  </li>
+                ))}
+            </ul>
+          </div>
+        )}
 
         {tasks.length > 0 && (
           <div className="rounded-xl border border-vision-border bg-vision-panel p-4">

@@ -13,6 +13,7 @@ class GoalRequest(BaseModel):
 
 
 class GoalResponse(BaseModel):
+    run_id: str = ""
     goal: str
     strategy: str = ""
     final_answer: str = ""
@@ -63,6 +64,12 @@ class ReflectRequest(BaseModel):
 class IntuitionRequest(BaseModel):
     context: str
     user_id: str = "default"
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approved: bool
+    decided_by: str = "user"
+    note: str = ""
 
 
 class GuardianCheckRequest(BaseModel):

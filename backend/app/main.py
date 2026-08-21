@@ -22,8 +22,10 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
+from .agents.approvals import ApprovalGate
 from .agents.goal_graph import GoalModeEngine
 from .agents.intuition import IntuitionEngine
+from .agents.run_store import RunStatus, RunStore
 from .agents.tools import ToolBelt
 from .config import get_settings
 from .core.executor import build_executor, safe_workspace_path
@@ -32,6 +34,7 @@ from .guardian.constitution import CONSTITUTION, constitution_text
 from .guardian.guardian import ActionType, Guardian, ProposedAction
 from .memory.digital_twin import DigitalTwinMemory, MemoryItem, MemoryKind, ReflectionLoop
 from .schemas import (
+    ApprovalDecisionRequest,
     GoalRequest,
     GoalResponse,
     GuardianCheckRequest,
@@ -63,12 +66,16 @@ class Runtime:
     toolbelt: ToolBelt
     intuition: IntuitionEngine
     reflection: ReflectionLoop
+    approvals: ApprovalGate
+    runs: RunStore
+    checkpointer: Any = None
 
     def engine(self, event_sink: Any = None) -> GoalModeEngine:
         return GoalModeEngine(
             llm=self.llm, memory=self.memory, skills=self.skills,
             guardian=self.guardian, toolbelt=self.toolbelt,
             settings=settings, event_sink=event_sink,
+            checkpointer=self.checkpointer, approvals=self.approvals,
         )
 
 
@@ -89,21 +96,49 @@ async def lifespan(app: FastAPI):
     memory = DigitalTwinMemory(settings)
     skills = SkillLibrary(settings)
     guardian = Guardian(llm, settings)
-    toolbelt = ToolBelt(guardian, build_executor(settings), settings)
+    approvals = ApprovalGate(settings)
+    toolbelt = ToolBelt(guardian, build_executor(settings), settings, approvals=approvals)
+
+    # --- durable state -----------------------------------------------------
+    checkpointer = None
+    checkpoint_conn = None
+    if settings.checkpoint_enabled:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        checkpoint_conn = await aiosqlite.connect(str(settings.checkpoint_path))
+        checkpointer = AsyncSqliteSaver(checkpoint_conn)
+        await checkpointer.setup()
+        logger.info("checkpointer ready at %s", settings.checkpoint_path)
+
+    runs = RunStore(settings.checkpoint_path.with_name("runs.sqlite"))
+    await runs.connect()
+    orphans = await runs.mark_orphans_interrupted()
+
     rt = Runtime(
         llm=llm, memory=memory, skills=skills, guardian=guardian, toolbelt=toolbelt,
         intuition=IntuitionEngine(llm, memory, skills, settings),
         reflection=ReflectionLoop(memory, llm),
+        approvals=approvals, runs=runs, checkpointer=checkpointer,
     )
     logger.info(
-        "Vision AI online | llm=%s embeddings=%s executor=%s guardian=%s",
+        "Vision AI online | llm=%s embeddings=%s executor=%s guardian=%s "
+        "checkpoint=%s approvals=%s",
         llm.provider_name, settings.effective_embedding_provider(),
         settings.executor, settings.guardian_mode if settings.guardian_enabled else "off",
+        "on" if checkpointer else "off", settings.approval_mode,
     )
     if llm.is_mock:
         logger.warning("Running with the MOCK LLM — set OPENAI_API_KEY for real reasoning.")
+    if orphans:
+        logger.warning("%d run(s) interrupted by a previous shutdown are resumable.", orphans)
+
     yield
+
     await llm.aclose()
+    await runs.close()
+    if checkpoint_conn is not None:
+        await checkpoint_conn.close()
 
 
 app = FastAPI(
@@ -164,8 +199,23 @@ async def config() -> dict[str, Any]:
 
 @app.post("/api/goal", response_model=GoalResponse)
 async def run_goal(req: GoalRequest) -> GoalResponse:
-    state = await runtime().engine().run(req.goal, req.user_id)
+    r = runtime()
+    record = await r.runs.create(req.goal, req.user_id)
+    try:
+        state = await r.engine().run(req.goal, req.user_id, run_id=record.id)
+    except Exception as exc:
+        await r.runs.update(record.id, status=RunStatus.FAILED, error=str(exc))
+        raise HTTPException(500, f"Goal run failed: {exc}") from exc
+
+    await r.runs.update(
+        record.id,
+        status=RunStatus.FAILED if state.get("error") else RunStatus.COMPLETED,
+        final_answer=state.get("final_answer", ""),
+        error=state.get("error", ""),
+        tasks=state.get("tasks", []),
+    )
     return GoalResponse(
+        run_id=record.id,
         goal=req.goal,
         strategy=state.get("strategy", ""),
         final_answer=state.get("final_answer", ""),
@@ -175,6 +225,90 @@ async def run_goal(req: GoalRequest) -> GoalResponse:
         reflection=state.get("reflection", {}),
         error=state.get("error", ""),
     )
+
+
+@app.get("/api/runs")
+async def list_runs(limit: int = 30) -> dict[str, Any]:
+    records = await runtime().runs.list(limit)
+    return {"runs": [r.to_dict() for r in records]}
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str) -> dict[str, Any]:
+    r = runtime()
+    record = await r.runs.get(run_id)
+    if record is None:
+        raise HTTPException(404, "Run not found")
+    payload = record.to_dict()
+    snapshot = await r.engine().get_state(run_id)
+    payload["checkpoint"] = (
+        {"next": snapshot["next"], "has_state": True} if snapshot else {"has_state": False}
+    )
+    return payload
+
+
+@app.post("/api/runs/{run_id}/resume", response_model=GoalResponse)
+async def resume_run(run_id: str) -> GoalResponse:
+    """Continue a run that a restart or crash left unfinished."""
+    r = runtime()
+    record = await r.runs.get(run_id)
+    if record is None:
+        raise HTTPException(404, "Run not found")
+    if record.status in (RunStatus.COMPLETED, RunStatus.CANCELLED):
+        raise HTTPException(409, f"Run is {record.status.value}; nothing to resume.")
+    if r.checkpointer is None:
+        raise HTTPException(400, "Checkpointing is disabled; runs cannot be resumed.")
+
+    await r.runs.update(run_id, status=RunStatus.RUNNING)
+    try:
+        state = await r.engine().resume(run_id)
+    except ValueError as exc:
+        await r.runs.update(run_id, status=RunStatus.FAILED, error=str(exc))
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        await r.runs.update(run_id, status=RunStatus.FAILED, error=str(exc))
+        raise HTTPException(500, f"Resume failed: {exc}") from exc
+
+    await r.runs.update(
+        run_id,
+        status=RunStatus.FAILED if state.get("error") else RunStatus.COMPLETED,
+        final_answer=state.get("final_answer", ""),
+        error=state.get("error", ""),
+        tasks=state.get("tasks", []),
+    )
+    return GoalResponse(
+        run_id=run_id,
+        goal=record.goal,
+        strategy=state.get("strategy", ""),
+        final_answer=state.get("final_answer", ""),
+        tasks=state.get("tasks", []),
+        events=state.get("events", []),
+        activated_skills=state.get("activated_skills", []),
+        reflection=state.get("reflection", {}),
+        error=state.get("error", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop approvals
+# ---------------------------------------------------------------------------
+
+@app.get("/api/approvals")
+async def list_approvals(run_id: str | None = None) -> dict[str, Any]:
+    gate = runtime().approvals
+    return {"pending": gate.pending(run_id), "history": gate.history(20)}
+
+
+@app.post("/api/approvals/{request_id}")
+async def decide_approval(request_id: str, req: ApprovalDecisionRequest) -> dict[str, Any]:
+    resolved = await runtime().approvals.decide(
+        request_id, approved=req.approved, decided_by=req.decided_by, note=req.note
+    )
+    if resolved is None:
+        raise HTTPException(
+            404, "No such pending approval (it may have expired or been decided already)."
+        )
+    return resolved
 
 
 @app.websocket("/ws/goal")
@@ -189,26 +323,90 @@ async def goal_socket(ws: WebSocket) -> None:
             await ws.send_json({"type": "error", "message": "A goal is required."})
             return
 
+        r = runtime()
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
         async def sink(event: dict[str, Any]) -> None:
             await queue.put(event)
 
-        engine = runtime().engine(event_sink=sink)
-        task = asyncio.create_task(engine.run(goal, user_id))
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=0.4)
-                await ws.send_json(event)
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-        while not queue.empty():
-            await ws.send_json(queue.get_nowait())
+        # Approval prompts must reach this socket too, so the user can answer
+        # them live instead of the agent stalling until the deadline.
+        r.approvals.set_notifier(sink)
 
-        state = await task
+        resume_id = (payload.get("resume_run_id") or "").strip()
+        if resume_id:
+            record = await r.runs.get(resume_id)
+            if record is None:
+                await ws.send_json({"type": "error", "message": "Run not found."})
+                return
+            run_id, goal = resume_id, record.goal
+            await r.runs.update(run_id, status=RunStatus.RUNNING)
+            coro = r.engine(event_sink=sink).resume(run_id)
+        else:
+            record = await r.runs.create(goal, user_id)
+            run_id = record.id
+            coro = r.engine(event_sink=sink).run(goal, user_id, run_id=run_id)
+
+        await ws.send_json({"type": "run_started", "run_id": run_id, "goal": goal})
+
+        # Accept decisions from the client while the graph runs.
+        async def receive_decisions() -> None:
+            try:
+                while True:
+                    raw = await ws.receive_text()
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("type") == "approval_decision":
+                        await r.approvals.decide(
+                            str(msg.get("request_id", "")),
+                            approved=bool(msg.get("approved")),
+                            decided_by=str(msg.get("decided_by", "user")),
+                            note=str(msg.get("note", "")),
+                        )
+                    elif msg.get("type") == "cancel":
+                        await r.approvals.cancel_run(run_id)
+            except (WebSocketDisconnect, RuntimeError):
+                # The human is gone. Release any waiter immediately instead of
+                # blocking the agent until the approval deadline expires.
+                released = await r.approvals.cancel_run(run_id)
+                if released:
+                    logger.warning(
+                        "client disconnected; released %d pending approval(s) for run %s",
+                        released, run_id,
+                    )
+
+        task = asyncio.create_task(coro)
+        listener = asyncio.create_task(receive_decisions())
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.4)
+                    await ws.send_json(event)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+            while not queue.empty():
+                await ws.send_json(queue.get_nowait())
+
+            state = await task
+        finally:
+            listener.cancel()
+            # Belt and braces: never leave a waiter stranded for this run.
+            await r.approvals.cancel_run(run_id)
+            r.approvals.set_notifier(None)
+
+        await r.runs.update(
+            run_id,
+            status=RunStatus.FAILED if state.get("error") else RunStatus.COMPLETED,
+            final_answer=state.get("final_answer", ""),
+            error=state.get("error", ""),
+            tasks=state.get("tasks", []),
+        )
         await ws.send_json({
             "type": "final",
+            "run_id": run_id,
             "final_answer": state.get("final_answer", ""),
             "tasks": state.get("tasks", []),
             "reflection": state.get("reflection", {}),
